@@ -70,8 +70,9 @@ def _call_llm(prompt: str, max_tokens: int = 2048, temperature: float = 0.1) -> 
 
 
 def convert_to_wav(audio_bytes: bytes, file_name: str) -> tuple:
-    """Convert any audio format to 16kHz mono 16-bit WAV using miniaudio.
+    """Convert any audio format to 16kHz mono 16-bit WAV.
 
+    Tries miniaudio first (MP3/FLAC/Vorbis), falls back to pydub+ffmpeg (Opus/others).
     Returns (wav_bytes, format_detected).
     """
     if audio_bytes[:4] == b'RIFF':
@@ -79,25 +80,36 @@ def convert_to_wav(audio_bytes: bytes, file_name: str) -> tuple:
 
     ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "mp3"
 
-    # Decode with miniaudio (supports mp3, flac, ogg/vorbis, wav natively)
-    decoded = miniaudio.decode(audio_bytes,
-                               output_format=miniaudio.SampleFormat.SIGNED16,
-                               nchannels=1,
-                               sample_rate=16000)
-    pcm_data = decoded.samples.tobytes()
+    # Try miniaudio first (fast, no external deps for mp3/flac/vorbis)
+    try:
+        decoded = miniaudio.decode(audio_bytes,
+                                   output_format=miniaudio.SampleFormat.SIGNED16,
+                                   nchannels=1,
+                                   sample_rate=16000)
+        pcm_data = decoded.samples.tobytes()
+        return _pcm_to_wav(pcm_data), ext
+    except Exception as e:
+        print(f"miniaudio failed for {file_name}: {e}, trying ffmpeg...")
 
-    # Build WAV header
-    sr_val = 16000
-    ch = 1
-    sw = 2
+    # Fallback: pydub + ffmpeg (handles Opus, AAC, etc.)
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext if ext != "ogg" else "ogg")
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    buf = io.BytesIO()
+    audio.export(buf, format="wav")
+    return buf.getvalue(), ext
+
+
+def _pcm_to_wav(pcm_data: bytes) -> bytes:
+    """Wrap raw 16kHz mono 16-bit PCM in a WAV header."""
+    sr_val, ch, sw = 16000, 1, 2
     data_size = len(pcm_data)
     header = struct.pack('<4sI4s4sIHHIIHH4sI',
         b'RIFF', 36 + data_size, b'WAVE',
         b'fmt ', 16, 1, ch, sr_val,
         sr_val * ch * sw, ch * sw, sw * 8,
         b'data', data_size)
-
-    return header + pcm_data, ext
+    return header + pcm_data
 
 
 def transcribe_audio(audio_bytes: bytes, file_name: str) -> dict:
