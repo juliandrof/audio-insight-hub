@@ -1,6 +1,7 @@
 import os
 import subprocess
 import json
+import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
@@ -12,32 +13,55 @@ LAKEBASE_HOST = os.environ.get(
 LAKEBASE_DB = os.environ.get("DATABRICKS_LAKEBASE_DB", "audio_insight_hub")
 LAKEBASE_PORT = os.environ.get("DATABRICKS_LAKEBASE_PORT", "5432")
 
+# Cache for OAuth token
+_token_cache = {"token": None, "user": None}
+
 
 def _get_credentials():
-    """Get user and password for Lakebase connection.
-
-    In Databricks Apps, DATABRICKS_TOKEN is injected automatically
-    and we use the service principal or user token for auth.
-    """
+    """Get user and password for Lakebase connection."""
+    # 1. Explicit env vars (manual override)
     user = os.environ.get("DATABRICKS_LAKEBASE_USER", "")
     password = os.environ.get("DATABRICKS_LAKEBASE_PASSWORD", "")
-
     if user and password:
         return user, password
 
-    # In Databricks Apps environment, use the app's OAuth token
+    # 2. Databricks Apps environment (OAuth M2M)
+    client_id = os.environ.get("DATABRICKS_CLIENT_ID", "")
+    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
+    host = os.environ.get("DATABRICKS_HOST", "")
+
+    if client_id and client_secret and host:
+        # Get OAuth token via client credentials flow
+        try:
+            token_url = f"{host.rstrip('/')}/oidc/v1/token"
+            resp = httpx.post(
+                token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "scope": "all-apis",
+                },
+                auth=(client_id, client_secret),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            token = resp.json()["access_token"]
+            # For Lakebase, user = service principal client_id
+            return client_id, token
+        except Exception as e:
+            print(f"OAuth M2M token error: {e}")
+
+    # 3. DATABRICKS_TOKEN (e.g. PAT or injected token)
     token = os.environ.get("DATABRICKS_TOKEN", "")
     if token:
-        # For Databricks Apps, the user is the service principal email
-        # or we can use the token directly
-        user = os.environ.get("DATABRICKS_APP_USER", "databricks-app")
+        user = client_id or "token"
         return user, token
 
-    # Local dev: try CLI-based auth
+    # 4. Local dev: CLI-based auth
     try:
         profile = os.environ.get("DATABRICKS_PROFILE", "fevm-jsf")
+        cli = os.path.expanduser("~/bin/databricks")
         result = subprocess.run(
-            ["databricks", "postgres", "generate-database-credential",
+            [cli, "postgres", "generate-database-credential",
              "projects/audio-insight-hub/branches/production/endpoints/primary",
              "--profile", profile, "--output", "json"],
             capture_output=True, text=True, timeout=30,
@@ -46,22 +70,25 @@ def _get_credentials():
             password = json.loads(result.stdout)["token"]
 
         result2 = subprocess.run(
-            ["databricks", "current-user", "me", "--profile", profile, "--output", "json"],
+            [cli, "current-user", "me", "--profile", profile, "--output", "json"],
             capture_output=True, text=True, timeout=15,
         )
         if result2.returncode == 0:
             user = json.loads(result2.stdout)["userName"]
 
-        return user, password
+        if user and password:
+            return user, password
     except Exception:
         pass
 
-    return user, password
+    return "", ""
 
 
 def get_connection():
     """Get a connection to the Lakebase PostgreSQL database."""
     user, password = _get_credentials()
+    if not user or not password:
+        raise Exception("No Lakebase credentials available. Check env vars.")
     return psycopg2.connect(
         host=LAKEBASE_HOST,
         database=LAKEBASE_DB,
