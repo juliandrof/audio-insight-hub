@@ -1,7 +1,6 @@
 import os
 import io
 import json
-import struct
 import httpx
 import speech_recognition as sr
 
@@ -68,85 +67,57 @@ def _call_llm(prompt: str, max_tokens: int = 2048, temperature: float = 0.1) -> 
     return str(data)
 
 
-def _audio_bytes_to_wav(audio_bytes: bytes, file_name: str) -> bytes:
-    """Convert audio bytes to WAV. Handles WAV passthrough and raw PCM wrapping."""
-    # If already WAV, return as-is
-    if audio_bytes[:4] == b'RIFF':
-        return audio_bytes
-
-    # Try using pydub with ffmpeg (works if ffmpeg installed)
-    try:
-        from pydub import AudioSegment
-        ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "mp3"
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
-        buf = io.BytesIO()
-        audio.export(buf, format="wav")
-        return buf.getvalue()
-    except Exception:
-        pass
-
-    # Try using built-in audioop for basic conversion
-    # For MP3: use the raw bytes with a minimal WAV header
-    # This is a fallback — Google STT is lenient with audio quality
-    try:
-        import audioop
-        # Assume 16kHz mono 16-bit as reasonable defaults
-        sample_rate = 16000
-        channels = 1
-        sample_width = 2
-        # Wrap raw audio in WAV header
-        data_size = len(audio_bytes)
-        header = struct.pack('<4sI4s4sIHHIIHH4sI',
-            b'RIFF', 36 + data_size, b'WAVE',
-            b'fmt ', 16, 1, channels, sample_rate,
-            sample_rate * channels * sample_width, channels * sample_width, sample_width * 8,
-            b'data', data_size)
-        return header + audio_bytes
-    except Exception:
-        pass
-
-    return audio_bytes
-
-
 def transcribe_audio(audio_bytes: bytes, file_name: str) -> dict:
-    """Transcribe audio using Google Speech Recognition."""
+    """Transcribe audio using Google Speech Recognition.
+
+    Accepts WAV files natively. For MP3/other formats, attempts pydub conversion
+    (requires ffmpeg) or returns error suggesting WAV format.
+    """
     recognizer = sr.Recognizer()
 
-    # Convert to WAV
-    wav_bytes = _audio_bytes_to_wav(audio_bytes, file_name)
+    # If not WAV, try converting with pydub/ffmpeg
+    if audio_bytes[:4] != b'RIFF':
+        try:
+            from pydub import AudioSegment
+            ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "mp3"
+            audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
+            buf = io.BytesIO()
+            audio.export(buf, format="wav", parameters=["-ar", "16000", "-ac", "1"])
+            audio_bytes = buf.getvalue()
+        except Exception as e:
+            print(f"Cannot convert {file_name} to WAV: {e}")
+            return {"text": f"[Formato nao suportado: {file_name}. Use arquivos WAV.]"}
 
-    # Split into chunks via SpeechRecognition
+    # Read WAV with SpeechRecognition
     try:
-        audio_file = sr.AudioFile(io.BytesIO(wav_bytes))
-        with audio_file as source:
+        with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
             total_duration = source.DURATION
     except Exception as e:
-        print(f"Cannot read audio file {file_name}: {e}")
+        print(f"Cannot read audio {file_name}: {e}")
         return {"text": f"[Erro ao ler audio: {file_name}]"}
 
+    # Transcribe in chunks of ~55s (Google API limit)
     chunk_seconds = 55
-    transcription_parts = []
-
+    parts = []
     offset = 0
-    while offset < total_duration:
-        duration = min(chunk_seconds, total_duration - offset)
-        with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
-            audio_data = recognizer.record(source, offset=offset, duration=duration)
 
+    while offset < total_duration:
+        dur = min(chunk_seconds, total_duration - offset)
+        with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
+            audio_data = recognizer.record(source, offset=offset, duration=dur)
         try:
             text = recognizer.recognize_google(audio_data, language="pt-BR")
-            transcription_parts.append(text)
+            parts.append(text)
         except sr.UnknownValueError:
-            pass  # skip unrecognizable chunks
+            pass
         except sr.RequestError as e:
-            print(f"Google STT request error: {e}")
-            transcription_parts.append("[erro de transcricao]")
-
+            print(f"Google STT error: {e}")
+            parts.append("[erro de transcricao]")
         offset += chunk_seconds
 
-    full_text = " ".join(transcription_parts)
+    full_text = " ".join(parts)
     if not full_text.strip():
-        return {"text": f"[Audio nao reconhecido: {file_name}]"}
+        return {"text": f"[Audio sem fala reconhecida: {file_name}]"}
 
     return {"text": full_text}
 
