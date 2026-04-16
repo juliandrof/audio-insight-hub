@@ -30,7 +30,7 @@ export default function ProcessPage({ onNavigate }) {
   const [dragOver, setDragOver] = useState(false)
 
   // Batch state
-  const [volumePath, setVolumePath] = useState('/Volumes/jsf_demo_catalog/audio_insight_hub/sample_audios')
+  const [volumePath, setVolumePath] = useState('/Volumes/serverless_stable_jsf_catalog/audio_insight_hub/sample_audios')
   const [volumeFiles, setVolumeFiles] = useState(null)
   const [loadingFiles, setLoadingFiles] = useState(false)
   const [processing, setProcessing] = useState(false)
