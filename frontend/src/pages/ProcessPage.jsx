@@ -7,11 +7,13 @@ import {
 import { useTranslation } from '../i18n/useTranslation'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../hooks/useToast'
+import { useProcessing } from '../hooks/useProcessing'
 
 export default function ProcessPage({ onNavigate }) {
   const { t } = useTranslation()
   const api = useApi()
   const toast = useToast()
+  const proc = useProcessing()
   const fileInput = useRef(null)
 
   // State
@@ -38,10 +40,6 @@ export default function ProcessPage({ onNavigate }) {
   const [playingPath, setPlayingPath] = useState(null)
   const [selectedFiles, setSelectedFiles] = useState(new Set())
   const [fileSearch, setFileSearch] = useState('')
-
-  // Processing queue state
-  const [queue, setQueue] = useState([])          // [{name, status, stage, message, result}]
-  const [queueDone, setQueueDone] = useState(null) // {processed, errors}
 
   // Audio player
   const audioRef = useRef(null)
@@ -154,31 +152,30 @@ export default function ProcessPage({ onNavigate }) {
     if (!volumePath.trim() || selectedFiles.size === 0) {
       toast.error('Selecione pelo menos um audio'); return
     }
-    setProcessing(true); setBatchResults(null); setQueueDone(null)
-    // Init queue with pending status
-    setQueue([...selectedFiles].map(name => ({ name, status: 'pending', stage: '', message: 'Na fila...' })))
+
+    const files = [...selectedFiles]
+    proc.startProcessing(files)
+    setProcessing(true)
+
+    // Navigate to processing status page immediately
+    onNavigate('processing')
 
     try {
-      await api.processBatchSSE(volumePath.trim(), selectedCats, [...selectedFiles], (event) => {
+      await api.processBatchSSE(volumePath.trim(), selectedCats, files, (event) => {
         if (event.type === 'status') {
-          setQueue(prev => prev.map(q =>
-            q.name === event.file ? { ...q, status: 'processing', stage: event.stage, message: event.message } : q
-          ))
+          proc.updateFile(event.file, { status: 'processing', stage: event.stage, message: event.message })
         } else if (event.type === 'completed') {
-          setQueue(prev => prev.map(q =>
-            q.name === event.file ? { ...q, status: 'done', stage: 'done', message: 'Concluido!', result: event.result } : q
-          ))
+          proc.updateFile(event.file, { status: 'done', stage: 'done', message: 'Concluido!', result: event.result })
         } else if (event.type === 'error') {
-          setQueue(prev => prev.map(q =>
-            q.name === event.file ? { ...q, status: 'error', stage: 'error', message: event.error } : q
-          ))
+          proc.updateFile(event.file, { status: 'error', stage: 'error', message: event.error })
         } else if (event.type === 'done') {
-          setQueueDone(event)
+          proc.finishProcessing(event)
           toast.success(`${event.processed} audios processados!`)
         }
       })
     } catch (err) {
       toast.error(err.message)
+      proc.finishProcessing({ processed: 0, errors: 1 })
     } finally {
       setProcessing(false)
     }
@@ -555,106 +552,14 @@ export default function ProcessPage({ onNavigate }) {
             </div>
           )}
 
-          {/* Processing Queue */}
-          {queue.length > 0 && (
-            <div className="glass-card p-5 space-y-3 animate-[fadeIn_0.2s_ease-out]">
-              {/* Queue header */}
-              <div className="flex items-center justify-between">
-                <h3 className="font-semibold text-gray-800 dark:text-gray-200 flex items-center gap-2">
-                  {processing && <Loader2 className="w-4 h-4 animate-spin text-brand-500" />}
-                  Fila de Processamento
-                </h3>
-                <span className="text-xs font-medium text-gray-500">
-                  {queue.filter(q => q.status === 'done').length}/{queue.length} concluidos
-                </span>
-              </div>
-
-              {/* Progress bar global */}
-              <div className="h-2 bg-gray-200 dark:bg-gray-800 rounded-full overflow-hidden">
-                <div className="h-full gradient-bg rounded-full transition-all duration-500"
-                  style={{ width: `${(queue.filter(q => q.status === 'done' || q.status === 'error').length / queue.length) * 100}%` }} />
-              </div>
-
-              {/* File queue */}
-              <div className="space-y-2 max-h-96 overflow-y-auto">
-                {queue.map((q, i) => {
-                  const stageIcons = {
-                    downloading: { icon: FolderOpen, color: 'text-blue-500' },
-                    transcribing: { icon: Headphones, color: 'text-purple-500' },
-                    analyzing: { icon: Sparkles, color: 'text-amber-500' },
-                    saving: { icon: Database, color: 'text-cyan-500' },
-                    done: { icon: CheckCircle2, color: 'text-green-500' },
-                    error: { icon: AlertCircle, color: 'text-red-500' },
-                  }
-                  const stageInfo = stageIcons[q.stage] || stageIcons.downloading
-                  const StageIcon = q.status === 'pending' ? Clock : stageInfo.icon
-
-                  return (
-                    <div key={i} className={`flex items-center gap-3 p-3 rounded-xl transition-all
-                      ${q.status === 'processing' ? 'bg-brand-50 dark:bg-brand-500/10 ring-1 ring-brand-500/20' :
-                        q.status === 'done' ? 'bg-green-50 dark:bg-green-500/5' :
-                        q.status === 'error' ? 'bg-red-50 dark:bg-red-500/5' :
-                        'bg-gray-50 dark:bg-gray-800/50'}`}
-                      onClick={() => q.result && onNavigate('detail', q.result.id)}
-                      style={{ cursor: q.result ? 'pointer' : 'default' }}
-                    >
-                      {/* Status icon */}
-                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0
-                        ${q.status === 'processing' ? 'bg-brand-100 dark:bg-brand-500/20' :
-                          q.status === 'done' ? 'bg-green-100 dark:bg-green-500/20' :
-                          q.status === 'error' ? 'bg-red-100 dark:bg-red-500/20' :
-                          'bg-gray-200 dark:bg-gray-700'}`}>
-                        {q.status === 'processing'
-                          ? <Loader2 className="w-4 h-4 text-brand-500 animate-spin" />
-                          : <StageIcon className={`w-4 h-4 ${q.status === 'pending' ? 'text-gray-400' : stageInfo.color}`} />
-                        }
-                      </div>
-
-                      {/* File info */}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className={`text-sm font-medium truncate
-                            ${q.status === 'done' ? 'text-green-700 dark:text-green-400' :
-                              q.status === 'error' ? 'text-red-700 dark:text-red-400' :
-                              q.status === 'processing' ? 'text-brand-700 dark:text-brand-400' :
-                              'text-gray-500'}`}>{q.name}</p>
-                          {q.result?.category_name && (
-                            <span className="badge text-xs bg-brand-100 dark:bg-brand-500/20 text-brand-600">{q.result.category_name}</span>
-                          )}
-                        </div>
-                        <p className={`text-xs mt-0.5
-                          ${q.status === 'processing' ? 'text-brand-500 font-medium' : 'text-gray-400'}`}>
-                          {q.status === 'done' && q.result?.summary ? q.result.summary.slice(0, 80) + '...' : q.message}
-                        </p>
-                      </div>
-
-                      {/* Stage pills for active item */}
-                      {q.status === 'processing' && (
-                        <div className="flex gap-0.5">
-                          {[...Array(4)].map((_, j) => (
-                            <div key={j} className="w-1 bg-brand-500 rounded-full wave-animation"
-                              style={{ height: `${8 + Math.random() * 10}px`, animationDelay: `${j * 0.15}s` }} />
-                          ))}
-                        </div>
-                      )}
-
-                      {q.result && <ChevronRight className="w-4 h-4 text-gray-400 flex-shrink-0" />}
-                    </div>
-                  )
-                })}
-              </div>
-
-              {/* Done summary */}
-              {queueDone && (
-                <div className="pt-3 border-t border-gray-200 dark:border-gray-800 flex items-center gap-3">
-                  <CheckCircle2 className="w-5 h-5 text-green-500" />
-                  <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                    {queueDone.processed} processados
-                    {queueDone.errors > 0 && <span className="text-red-500 ml-2">{queueDone.errors} erros</span>}
-                  </p>
-                </div>
-              )}
-            </div>
+          {/* Link to processing status if running */}
+          {proc.isRunning && (
+            <button onClick={() => onNavigate('processing')}
+              className="glass-card p-4 w-full flex items-center gap-3 hover:shadow-lg transition-all cursor-pointer">
+              <Loader2 className="w-5 h-5 text-brand-500 animate-spin" />
+              <span className="font-medium text-brand-600 dark:text-brand-400">Processamento em andamento — clique para acompanhar</span>
+              <ChevronRight className="w-4 h-4 text-gray-400 ml-auto" />
+            </button>
           )}
         </div>
       )}

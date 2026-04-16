@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import {
-  LayoutDashboard, Headphones, FileText, Settings,
+  LayoutDashboard, Headphones, FileText, Settings, Activity,
   Menu, X, AudioWaveform, Globe, Moon, Sun
 } from 'lucide-react'
 import { useTranslation } from './i18n/useTranslation'
 import { ToastProvider } from './hooks/useToast'
+import { ProcessingProvider, useProcessing } from './hooks/useProcessing'
 import Dashboard from './pages/Dashboard'
 import ProcessPage from './pages/ProcessPage'
+import ProcessingStatus from './pages/ProcessingStatus'
 import AnalysesPage from './pages/AnalysesPage'
 import AnalysisDetail from './pages/AnalysisDetail'
 import SettingsPage from './pages/SettingsPage'
@@ -18,7 +20,18 @@ const LANGUAGES = [
 ]
 
 export default function App() {
+  return (
+    <ProcessingProvider>
+      <ToastProvider>
+        <AppInner />
+      </ToastProvider>
+    </ProcessingProvider>
+  )
+}
+
+function AppInner() {
   const { t, locale, changeLocale } = useTranslation()
+  const proc = useProcessing()
   const [page, setPage] = useState('dashboard')
   const [detailId, setDetailId] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -41,6 +54,7 @@ export default function App() {
   const navItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: t('nav.dashboard') },
     { id: 'process', icon: Headphones, label: 'Processar' },
+    { id: 'processing', icon: Activity, label: 'Processamento', badge: proc.isRunning },
     { id: 'analyses', icon: FileText, label: t('nav.analyses') },
     { id: 'settings', icon: Settings, label: t('nav.settings') },
   ]
@@ -55,6 +69,7 @@ export default function App() {
     switch (page) {
       case 'dashboard': return <Dashboard />
       case 'process': return <ProcessPage onNavigate={navigate} />
+      case 'processing': return <ProcessingStatus onNavigate={navigate} />
       case 'analyses': return <AnalysesPage onNavigate={navigate} />
       case 'detail': return <AnalysisDetail id={detailId} onBack={() => navigate('analyses')} />
       case 'settings': return <SettingsPage />
@@ -63,7 +78,6 @@ export default function App() {
   }
 
   return (
-    <ToastProvider>
       <div className="flex h-screen overflow-hidden bg-gray-50 dark:bg-gray-950">
         {/* Sidebar */}
         <aside className={`
@@ -89,14 +103,24 @@ export default function App() {
 
           {/* Navigation */}
           <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
-            {navItems.map(({ id, icon: Icon, label }) => (
+            {navItems.map(({ id, icon: Icon, label, badge }) => (
               <button
                 key={id}
                 onClick={() => navigate(id)}
                 className={`sidebar-link w-full text-left ${page === id ? 'sidebar-link-active' : ''}`}
               >
-                <Icon className="w-5 h-5" />
-                <span>{label}</span>
+                <div className="relative">
+                  <Icon className="w-5 h-5" />
+                  {badge && (
+                    <div className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-brand-500 rounded-full animate-pulse" />
+                  )}
+                </div>
+                <span className="flex-1">{label}</span>
+                {badge && (
+                  <span className="text-xs font-medium text-brand-500 bg-brand-100 dark:bg-brand-500/20 px-2 py-0.5 rounded-full">
+                    {proc.queue.filter(q => q.status === 'done').length}/{proc.queue.length}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
@@ -164,6 +188,5 @@ export default function App() {
           </div>
         </main>
       </div>
-    </ToastProvider>
   )
 }
