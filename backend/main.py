@@ -1,10 +1,11 @@
 import os
 import json
+import base64
 import datetime
 import traceback
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,6 +54,11 @@ class SettingUpdate(BaseModel):
     value: str
 
 
+class BatchRequest(BaseModel):
+    volume_path: str
+    category_ids: list[int] = []
+
+
 # ---- Health ----
 
 @app.get("/api/health")
@@ -88,17 +94,13 @@ async def create_category(cat: CategoryCreate):
 
 @app.put("/api/categories/{cat_id}")
 async def update_category(cat_id: int, cat: CategoryUpdate):
-    updates = []
-    values = []
+    updates, values = [], []
     if cat.name is not None:
-        updates.append("name = %s")
-        values.append(cat.name)
+        updates.append("name = %s"); values.append(cat.name)
     if cat.color is not None:
-        updates.append("color = %s")
-        values.append(cat.color)
+        updates.append("color = %s"); values.append(cat.color)
     if cat.icon is not None:
-        updates.append("icon = %s")
-        values.append(cat.icon)
+        updates.append("icon = %s"); values.append(cat.icon)
     if not updates:
         raise HTTPException(400, "No fields to update")
     values.append(cat_id)
@@ -117,159 +119,183 @@ async def delete_category(cat_id: int):
         return {"deleted": True}
 
 
-# ---- Audio Processing ----
+# ---- Shared processing logic ----
+
+def _get_category_names(category_ids: list[int] | None = None) -> list[str]:
+    """Get category names, optionally filtered by IDs."""
+    with get_cursor() as cur:
+        if category_ids:
+            placeholders = ",".join(["%s"] * len(category_ids))
+            cur.execute(f"SELECT name FROM categories WHERE id IN ({placeholders}) ORDER BY name", category_ids)
+        else:
+            cur.execute("SELECT name FROM categories ORDER BY name")
+        return [r["name"] for r in cur.fetchall()]
+
+
+def _process_and_save(file_name: str, audio_bytes: bytes, category_names: list[str],
+                      file_path: str | None = None) -> dict:
+    """Transcribe, analyze, and save a single audio file."""
+    transcript_result = transcribe_audio(audio_bytes, file_name)
+    transcription = transcript_result["text"]
+
+    analysis = analyze_transcription(transcription, category_names)
+
+    category_id = None
+    with get_cursor() as cur:
+        cur.execute("SELECT id FROM categories WHERE name = %s", (analysis.get("category", ""),))
+        row = cur.fetchone()
+        if row:
+            category_id = row["id"]
+
+    with get_cursor() as cur:
+        cur.execute(
+            """INSERT INTO audio_analyses
+            (file_name, file_path, file_size, transcription, summary, category_id,
+             sentiment, sentiment_score, key_topics, urgency_level,
+             language_detected, speaker_count, action_items, processed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *""",
+            (
+                file_name, file_path, len(audio_bytes),
+                transcription, analysis.get("summary", ""), category_id,
+                analysis.get("sentiment", "neutral"),
+                analysis.get("sentiment_score", 0.5),
+                analysis.get("key_topics", []),
+                analysis.get("urgency_level", "normal"),
+                analysis.get("language_detected", "pt"),
+                analysis.get("speaker_count", 1),
+                analysis.get("action_items", []),
+                datetime.datetime.now(),
+            ),
+        )
+        saved = cur.fetchone()
+
+    return {
+        **_serialize_row(saved),
+        "category_name": analysis.get("category", ""),
+    }
+
+
+# ---- Audio Upload (single file) ----
 
 @app.post("/api/audio/upload")
-async def upload_and_process(file: UploadFile = File(...)):
-    """Upload an audio file, transcribe it, and analyze."""
+async def upload_and_process(
+    file: UploadFile = File(...),
+    category_ids: str = Form(default=""),
+):
+    """Upload an audio file, transcribe and analyze."""
     if not file.filename:
         raise HTTPException(400, "No file provided")
 
     audio_bytes = await file.read()
-    file_size = len(audio_bytes)
+    cat_ids = [int(x) for x in category_ids.split(",") if x.strip()] if category_ids else []
 
     try:
-        # Step 1: Transcribe
-        transcript_result = transcribe_audio(audio_bytes, file.filename)
-        transcription = transcript_result["text"]
-
-        # Step 2: Get categories for analysis
-        with get_cursor() as cur:
-            cur.execute("SELECT name FROM categories ORDER BY name")
-            categories = [r["name"] for r in cur.fetchall()]
-
-        # Step 3: Analyze
-        analysis = analyze_transcription(transcription, categories)
-
-        # Step 4: Find category ID
-        category_id = None
-        with get_cursor() as cur:
-            cur.execute("SELECT id FROM categories WHERE name = %s", (analysis.get("category", ""),))
-            row = cur.fetchone()
-            if row:
-                category_id = row["id"]
-
-        # Step 5: Save to database
-        with get_cursor() as cur:
-            cur.execute(
-                """INSERT INTO audio_analyses
-                (file_name, file_size, transcription, summary, category_id,
-                 sentiment, sentiment_score, key_topics, urgency_level,
-                 language_detected, speaker_count, action_items, processed_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *""",
-                (
-                    file.filename,
-                    file_size,
-                    transcription,
-                    analysis.get("summary", ""),
-                    category_id,
-                    analysis.get("sentiment", "neutral"),
-                    analysis.get("sentiment_score", 0.5),
-                    analysis.get("key_topics", []),
-                    analysis.get("urgency_level", "normal"),
-                    analysis.get("language_detected", "pt"),
-                    analysis.get("speaker_count", 1),
-                    analysis.get("action_items", []),
-                    datetime.datetime.now(),
-                ),
-            )
-            saved = cur.fetchone()
-
-        return {
-            **dict(saved),
-            "category_name": analysis.get("category", ""),
-            "created_at": str(saved["created_at"]) if saved.get("created_at") else None,
-            "processed_at": str(saved["processed_at"]) if saved.get("processed_at") else None,
-        }
-
+        categories = _get_category_names(cat_ids if cat_ids else None)
+        return _process_and_save(file.filename, audio_bytes, categories)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"Processing error: {str(e)}")
 
 
-@app.post("/api/audio/process-volume")
-async def process_from_volume(
-    volume_path: str = Query(..., description="Databricks Volume path e.g. /Volumes/catalog/schema/volume"),
-):
-    """List and process audio files from a Databricks Volume."""
+# ---- Batch (Volume) Processing ----
+
+@app.post("/api/audio/batch")
+async def process_batch(req: BatchRequest):
+    """Process audio files from a Databricks Volume."""
     from databricks.sdk import WorkspaceClient
 
-    w = WorkspaceClient()
+    try:
+        w = WorkspaceClient()
+    except Exception as e:
+        raise HTTPException(500, f"Could not connect to Databricks: {e}")
+
+    categories = _get_category_names(req.category_ids if req.category_ids else None)
     results = []
+    errors = []
+    audio_extensions = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".webm"}
 
     try:
-        files = w.files.list_directory_contents(volume_path)
-        audio_extensions = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".webm"}
+        files = list(w.files.list_directory_contents(req.volume_path))
+    except Exception as e:
+        raise HTTPException(400, f"Cannot list volume: {e}")
 
-        for f in files:
-            if not f.path:
-                continue
-            ext = "." + f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
-            if ext not in audio_extensions:
-                continue
+    audio_files = [
+        f for f in files
+        if f.path and ("." + f.path.rsplit(".", 1)[-1].lower() if "." in f.path else "") in audio_extensions
+    ]
 
-            # Download file
+    if not audio_files:
+        raise HTTPException(404, "No audio files found in this volume path")
+
+    for f in audio_files:
+        file_name = f.path.rsplit("/", 1)[-1]
+        try:
             resp = w.files.download(f.path)
             audio_bytes = resp.contents.read()
+            result = _process_and_save(file_name, audio_bytes, categories, file_path=f.path)
+            results.append(result)
+        except Exception as e:
+            traceback.print_exc()
+            errors.append({"file": file_name, "error": str(e)})
 
-            file_name = f.path.rsplit("/", 1)[-1]
+    return {
+        "processed": len(results),
+        "errors": len(errors),
+        "results": results,
+        "error_details": errors,
+    }
 
-            # Transcribe
-            transcript_result = transcribe_audio(audio_bytes, file_name)
-            transcription = transcript_result["text"]
 
-            # Get categories
-            with get_cursor() as cur:
-                cur.execute("SELECT name FROM categories ORDER BY name")
-                categories = [r["name"] for r in cur.fetchall()]
+# ---- List Volume Files (for preview) ----
 
-            # Analyze
-            analysis = analyze_transcription(transcription, categories)
+@app.get("/api/volume/list")
+async def list_volume_files(path: str = Query(...)):
+    """List audio files in a volume for preview."""
+    from databricks.sdk import WorkspaceClient
 
-            # Find category ID
-            category_id = None
-            with get_cursor() as cur:
-                cur.execute("SELECT id FROM categories WHERE name = %s", (analysis.get("category", ""),))
-                row = cur.fetchone()
-                if row:
-                    category_id = row["id"]
-
-            # Save
-            with get_cursor() as cur:
-                cur.execute(
-                    """INSERT INTO audio_analyses
-                    (file_name, file_path, file_size, transcription, summary, category_id,
-                     sentiment, sentiment_score, key_topics, urgency_level,
-                     language_detected, speaker_count, action_items, processed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING *""",
-                    (
-                        file_name, f.path, len(audio_bytes),
-                        transcription, analysis.get("summary", ""), category_id,
-                        analysis.get("sentiment", "neutral"),
-                        analysis.get("sentiment_score", 0.5),
-                        analysis.get("key_topics", []),
-                        analysis.get("urgency_level", "normal"),
-                        analysis.get("language_detected", "pt"),
-                        analysis.get("speaker_count", 1),
-                        analysis.get("action_items", []),
-                        datetime.datetime.now(),
-                    ),
-                )
-                saved = cur.fetchone()
-                results.append({
-                    **dict(saved),
-                    "category_name": analysis.get("category", ""),
-                    "created_at": str(saved["created_at"]) if saved.get("created_at") else None,
-                    "processed_at": str(saved["processed_at"]) if saved.get("processed_at") else None,
-                })
-
+    try:
+        w = WorkspaceClient()
+        files = list(w.files.list_directory_contents(path))
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Volume processing error: {str(e)}")
+        raise HTTPException(400, f"Cannot list volume: {e}")
 
-    return {"processed": len(results), "results": results}
+    audio_extensions = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".webm"}
+    audio_files = []
+    for f in files:
+        if not f.path:
+            continue
+        ext = "." + f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
+        if ext in audio_extensions:
+            audio_files.append({
+                "name": f.path.rsplit("/", 1)[-1],
+                "path": f.path,
+                "size": getattr(f, "file_size", None),
+            })
+
+    return {"files": audio_files, "total": len(audio_files)}
+
+
+# ---- Serve audio from volume (for player) ----
+
+@app.get("/api/audio/stream")
+async def stream_audio(path: str = Query(...)):
+    """Stream an audio file from a Databricks Volume for the player."""
+    from databricks.sdk import WorkspaceClient
+
+    try:
+        w = WorkspaceClient()
+        resp = w.files.download(path)
+        audio_bytes = resp.contents.read()
+    except Exception as e:
+        raise HTTPException(400, f"Cannot read file: {e}")
+
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else "mp3"
+    mime_map = {
+        "wav": "audio/wav", "mp3": "audio/mpeg", "ogg": "audio/ogg",
+        "flac": "audio/flac", "m4a": "audio/mp4", "webm": "audio/webm",
+    }
+    return Response(content=audio_bytes, media_type=mime_map.get(ext, "audio/mpeg"))
 
 
 # ---- Analyses ----
@@ -282,14 +308,11 @@ async def list_analyses(
     limit: int = 50,
     offset: int = 0,
 ):
-    conditions = []
-    params = []
+    conditions, params = [], []
     if category_id:
-        conditions.append("a.category_id = %s")
-        params.append(category_id)
+        conditions.append("a.category_id = %s"); params.append(category_id)
     if sentiment:
-        conditions.append("a.sentiment = %s")
-        params.append(sentiment)
+        conditions.append("a.sentiment = %s"); params.append(sentiment)
     if search:
         conditions.append("(a.file_name ILIKE %s OR a.transcription ILIKE %s OR a.summary ILIKE %s)")
         params.extend([f"%{search}%"] * 3)
@@ -302,11 +325,8 @@ async def list_analyses(
 
         cur.execute(
             f"""SELECT a.*, c.name as category_name, c.color as category_color, c.icon as category_icon
-                FROM audio_analyses a
-                LEFT JOIN categories c ON a.category_id = c.id
-                {where}
-                ORDER BY a.created_at DESC
-                LIMIT %s OFFSET %s""",
+                FROM audio_analyses a LEFT JOIN categories c ON a.category_id = c.id
+                {where} ORDER BY a.created_at DESC LIMIT %s OFFSET %s""",
             params + [limit, offset],
         )
         rows = cur.fetchall()
@@ -319,8 +339,7 @@ async def get_analysis(analysis_id: int):
     with get_cursor() as cur:
         cur.execute(
             """SELECT a.*, c.name as category_name, c.color as category_color, c.icon as category_icon
-               FROM audio_analyses a
-               LEFT JOIN categories c ON a.category_id = c.id
+               FROM audio_analyses a LEFT JOIN categories c ON a.category_id = c.id
                WHERE a.id = %s""",
             (analysis_id,),
         )
@@ -344,55 +363,30 @@ async def dashboard_stats():
     with get_cursor() as cur:
         cur.execute("SELECT COUNT(*) as total FROM audio_analyses")
         total = cur.fetchone()["total"]
-
-        cur.execute(
-            """SELECT sentiment, COUNT(*) as count
-               FROM audio_analyses GROUP BY sentiment"""
-        )
+        cur.execute("SELECT sentiment, COUNT(*) as count FROM audio_analyses GROUP BY sentiment")
         sentiments = {r["sentiment"]: r["count"] for r in cur.fetchall()}
-
         cur.execute(
-            """SELECT c.name, c.color, COUNT(a.id) as count
-               FROM categories c
+            """SELECT c.name, c.color, COUNT(a.id) as count FROM categories c
                LEFT JOIN audio_analyses a ON a.category_id = c.id
-               GROUP BY c.name, c.color
-               ORDER BY count DESC"""
-        )
+               GROUP BY c.name, c.color ORDER BY count DESC""")
         categories = cur.fetchall()
-
-        cur.execute(
-            """SELECT urgency_level, COUNT(*) as count
-               FROM audio_analyses GROUP BY urgency_level"""
-        )
+        cur.execute("SELECT urgency_level, COUNT(*) as count FROM audio_analyses GROUP BY urgency_level")
         urgency = {r["urgency_level"]: r["count"] for r in cur.fetchall()}
-
         cur.execute("SELECT AVG(sentiment_score) as avg_score FROM audio_analyses")
         avg_sentiment = cur.fetchone()["avg_score"]
-
         cur.execute(
-            """SELECT DATE(created_at) as date, COUNT(*) as count
-               FROM audio_analyses
+            """SELECT DATE(created_at) as date, COUNT(*) as count FROM audio_analyses
                WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
-               GROUP BY DATE(created_at)
-               ORDER BY date"""
-        )
+               GROUP BY DATE(created_at) ORDER BY date""")
         timeline = cur.fetchall()
-
-        # Top topics
         cur.execute(
-            """SELECT unnest(key_topics) as topic, COUNT(*) as count
-               FROM audio_analyses
-               GROUP BY topic
-               ORDER BY count DESC
-               LIMIT 10"""
-        )
+            """SELECT unnest(key_topics) as topic, COUNT(*) as count FROM audio_analyses
+               GROUP BY topic ORDER BY count DESC LIMIT 10""")
         top_topics = cur.fetchall()
 
     return {
-        "total_analyses": total,
-        "sentiments": sentiments,
-        "categories": [dict(r) for r in categories],
-        "urgency": urgency,
+        "total_analyses": total, "sentiments": sentiments,
+        "categories": [dict(r) for r in categories], "urgency": urgency,
         "avg_sentiment_score": float(avg_sentiment) if avg_sentiment else 0.5,
         "timeline": [{"date": str(r["date"]), "count": r["count"]} for r in timeline],
         "top_topics": [dict(r) for r in top_topics],
@@ -405,82 +399,30 @@ async def dashboard_stats():
 async def export_single_pdf(analysis_id: int):
     with get_cursor() as cur:
         cur.execute(
-            """SELECT a.*, c.name as category_name
-               FROM audio_analyses a
-               LEFT JOIN categories c ON a.category_id = c.id
-               WHERE a.id = %s""",
+            "SELECT a.*, c.name as category_name FROM audio_analyses a LEFT JOIN categories c ON a.category_id = c.id WHERE a.id = %s",
             (analysis_id,),
         )
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Analysis not found")
-
     data = dict(row)
     data["category"] = data.pop("category_name", "N/A")
-    pdf_bytes = generate_analysis_pdf(data)
-
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="analise_{analysis_id}.pdf"'},
-    )
-
-
-@app.post("/api/export/pdf/batch")
-async def export_batch_pdf(analysis_ids: list[int]):
-    analyses = []
-    with get_cursor() as cur:
-        for aid in analysis_ids:
-            cur.execute(
-                """SELECT a.*, c.name as category_name
-                   FROM audio_analyses a
-                   LEFT JOIN categories c ON a.category_id = c.id
-                   WHERE a.id = %s""",
-                (aid,),
-            )
-            row = cur.fetchone()
-            if row:
-                data = dict(row)
-                data["category"] = data.pop("category_name", "N/A")
-                analyses.append(data)
-
-    if not analyses:
-        raise HTTPException(404, "No analyses found")
-
-    pdf_bytes = generate_batch_pdf(analyses)
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="relatorio_consolidado.pdf"'},
-    )
+    return Response(content=generate_analysis_pdf(data), media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="analise_{analysis_id}.pdf"'})
 
 
 @app.get("/api/export/pdf/all")
 async def export_all_pdf():
     with get_cursor() as cur:
-        cur.execute(
-            """SELECT a.*, c.name as category_name
-               FROM audio_analyses a
-               LEFT JOIN categories c ON a.category_id = c.id
-               ORDER BY a.created_at DESC"""
-        )
+        cur.execute("SELECT a.*, c.name as category_name FROM audio_analyses a LEFT JOIN categories c ON a.category_id = c.id ORDER BY a.created_at DESC")
         rows = cur.fetchall()
-
     if not rows:
         raise HTTPException(404, "No analyses found")
-
     analyses = []
     for row in rows:
-        data = dict(row)
-        data["category"] = data.pop("category_name", "N/A")
-        analyses.append(data)
-
-    pdf_bytes = generate_batch_pdf(analyses)
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="relatorio_completo.pdf"'},
-    )
+        d = dict(row); d["category"] = d.pop("category_name", "N/A"); analyses.append(d)
+    return Response(content=generate_batch_pdf(analyses), media_type="application/pdf",
+                    headers={"Content-Disposition": 'attachment; filename="relatorio_completo.pdf"'})
 
 
 # ---- Settings ----
@@ -496,8 +438,7 @@ async def get_settings():
 async def update_setting(setting: SettingUpdate):
     with get_cursor() as cur:
         cur.execute(
-            """INSERT INTO app_settings (key, value, updated_at)
-               VALUES (%s, %s, CURRENT_TIMESTAMP)
+            """INSERT INTO app_settings (key, value, updated_at) VALUES (%s, %s, CURRENT_TIMESTAMP)
                ON CONFLICT (key) DO UPDATE SET value = %s, updated_at = CURRENT_TIMESTAMP""",
             (setting.key, setting.value, setting.value),
         )
@@ -519,7 +460,6 @@ def _serialize_row(row):
         if isinstance(v, (datetime.datetime, datetime.date)):
             d[k] = v.isoformat()
     return d
-
 
 def _serialize_rows(rows):
     return [_serialize_row(r) for r in rows]

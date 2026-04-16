@@ -1,15 +1,14 @@
 import { useState } from 'react'
 import {
-  LayoutDashboard, Upload, FileText, Database, Settings,
+  LayoutDashboard, Headphones, FileText, Settings,
   Menu, X, AudioWaveform, Globe, Moon, Sun
 } from 'lucide-react'
 import { useTranslation } from './i18n/useTranslation'
 import { ToastProvider } from './hooks/useToast'
 import Dashboard from './pages/Dashboard'
-import UploadPage from './pages/UploadPage'
+import ProcessPage from './pages/ProcessPage'
 import AnalysesPage from './pages/AnalysesPage'
 import AnalysisDetail from './pages/AnalysisDetail'
-import VolumePage from './pages/VolumePage'
 import SettingsPage from './pages/SettingsPage'
 
 const LANGUAGES = [
@@ -41,9 +40,8 @@ export default function App() {
 
   const navItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: t('nav.dashboard') },
-    { id: 'upload', icon: Upload, label: t('nav.upload') },
+    { id: 'process', icon: Headphones, label: 'Processar' },
     { id: 'analyses', icon: FileText, label: t('nav.analyses') },
-    { id: 'volume', icon: Database, label: t('nav.volume') },
     { id: 'settings', icon: Settings, label: t('nav.settings') },
   ]
 
@@ -56,10 +54,9 @@ export default function App() {
   const renderPage = () => {
     switch (page) {
       case 'dashboard': return <Dashboard />
-      case 'upload': return <UploadPage onNavigate={navigate} />
+      case 'process': return <ProcessPage onNavigate={navigate} />
       case 'analyses': return <AnalysesPage onNavigate={navigate} />
       case 'detail': return <AnalysisDetail id={detailId} onBack={() => navigate('analyses')} />
-      case 'volume': return <VolumePage />
       case 'settings': return <SettingsPage />
       default: return <Dashboard />
     }
