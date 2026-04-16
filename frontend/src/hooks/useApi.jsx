@@ -44,8 +44,33 @@ export function useApi() {
   };
 
   const listVolumeFiles = (path) => apiFetch(`/volume/list?path=${encodeURIComponent(path)}`);
-  const processBatch = (volumePath, categoryIds, selectedFiles) =>
-    apiFetch('/audio/batch', { method: 'POST', body: JSON.stringify({ volume_path: volumePath, category_ids: categoryIds || [], selected_files: selectedFiles || [] }) });
+  const processBatchSSE = (volumePath, categoryIds, selectedFiles, onEvent) => {
+    return fetch(`${BASE}/audio/batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ volume_path: volumePath, category_ids: categoryIds || [], selected_files: selectedFiles || [] }),
+    }).then(async (res) => {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Batch failed');
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try { onEvent(JSON.parse(line.slice(6))); } catch {}
+          }
+        }
+      }
+    });
+  };
   const getAudioStreamUrl = (path) => `${BASE}/audio/stream?path=${encodeURIComponent(path)}`;
 
   const fetchAnalyses = (params = {}) => {
@@ -68,7 +93,7 @@ export function useApi() {
 
   return {
     fetchStats, fetchCategories, createCategory, updateCategory, deleteCategory,
-    uploadAudio, listVolumeFiles, processBatch, getAudioStreamUrl,
+    uploadAudio, listVolumeFiles, processBatchSSE, getAudioStreamUrl,
     fetchAnalyses, fetchAnalysis, deleteAnalysis, deleteAllAnalyses,
     exportPdf, exportAllPdf, fetchModels, fetchSettings, updateSetting,
   };

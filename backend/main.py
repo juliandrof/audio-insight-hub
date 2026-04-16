@@ -207,12 +207,13 @@ async def upload_and_process(
         raise HTTPException(500, f"Processing error: {str(e)}")
 
 
-# ---- Batch (Volume) Processing ----
+# ---- Batch (Volume) Processing with SSE ----
 
 @app.post("/api/audio/batch")
-async def process_batch(req: BatchRequest):
-    """Process audio files from a Databricks Volume."""
+async def process_batch_sse(req: BatchRequest):
+    """Process audio files with real-time status updates via SSE."""
     from databricks.sdk import WorkspaceClient
+    from starlette.responses import StreamingResponse
 
     try:
         w = WorkspaceClient()
@@ -220,8 +221,6 @@ async def process_batch(req: BatchRequest):
         raise HTTPException(500, f"Could not connect to Databricks: {e}")
 
     categories = _get_category_names(req.category_ids if req.category_ids else None)
-    results = []
-    errors = []
     audio_extensions = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".webm"}
 
     try:
@@ -234,34 +233,89 @@ async def process_batch(req: BatchRequest):
         if f.path and ("." + f.path.rsplit(".", 1)[-1].lower() if "." in f.path else "") in audio_extensions
     ]
 
-    if not audio_files:
-        raise HTTPException(404, "No audio files found in this volume path")
-
-    # Filter to selected files only
     if req.selected_files:
         selected_set = set(req.selected_files)
         audio_files = [f for f in audio_files if f.path.rsplit("/", 1)[-1] in selected_set]
 
     if not audio_files:
-        raise HTTPException(400, "No selected audio files found")
+        raise HTTPException(400, "No audio files found")
 
-    for f in audio_files:
-        file_name = f.path.rsplit("/", 1)[-1]
-        try:
-            resp = w.files.download(f.path)
-            audio_bytes = resp.contents.read()
-            result = _process_and_save(file_name, audio_bytes, categories, file_path=f.path)
-            results.append(result)
-        except Exception as e:
-            traceback.print_exc()
-            errors.append({"file": file_name, "error": str(e)})
+    def _sse(data):
+        return f"data: {json.dumps(data, default=str)}\n\n"
 
-    return {
-        "processed": len(results),
-        "errors": len(errors),
-        "results": results,
-        "error_details": errors,
-    }
+    async def event_stream():
+        total = len(audio_files)
+        results = []
+        errors = []
+
+        # Send queue info
+        queue = [f.path.rsplit("/", 1)[-1] for f in audio_files]
+        yield _sse({"type": "queue", "files": queue, "total": total})
+
+        for idx, f in enumerate(audio_files):
+            file_name = f.path.rsplit("/", 1)[-1]
+
+            try:
+                # Stage 1: downloading
+                yield _sse({"type": "status", "file": file_name, "index": idx, "total": total,
+                            "stage": "downloading", "message": f"Baixando {file_name}..."})
+                resp = w.files.download(f.path)
+                audio_bytes = resp.contents.read()
+
+                # Stage 2: transcribing
+                yield _sse({"type": "status", "file": file_name, "index": idx, "total": total,
+                            "stage": "transcribing", "message": f"Transcrevendo {file_name}..."})
+                transcript_result = transcribe_audio(audio_bytes, file_name)
+                transcription = transcript_result["text"]
+
+                # Stage 3: analyzing
+                yield _sse({"type": "status", "file": file_name, "index": idx, "total": total,
+                            "stage": "analyzing", "message": f"Analisando sentimento e categorias..."})
+                analysis = analyze_transcription(transcription, categories)
+
+                # Stage 4: saving
+                yield _sse({"type": "status", "file": file_name, "index": idx, "total": total,
+                            "stage": "saving", "message": f"Salvando resultados..."})
+
+                category_id = None
+                with get_cursor() as cur:
+                    cur.execute("SELECT id FROM categories WHERE name = %s", (analysis.get("category", ""),))
+                    row = cur.fetchone()
+                    if row:
+                        category_id = row["id"]
+
+                with get_cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO audio_analyses
+                        (file_name, file_path, file_size, transcription, summary, category_id,
+                         sentiment, sentiment_score, key_topics, urgency_level,
+                         language_detected, speaker_count, action_items, processed_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING *""",
+                        (file_name, f.path, len(audio_bytes),
+                         transcription, analysis.get("summary", ""), category_id,
+                         analysis.get("sentiment", "neutral"), analysis.get("sentiment_score", 0.5),
+                         analysis.get("key_topics", []), analysis.get("urgency_level", "normal"),
+                         analysis.get("language_detected", "pt"), analysis.get("speaker_count", 1),
+                         analysis.get("action_items", []), datetime.datetime.now()),
+                    )
+                    saved = cur.fetchone()
+
+                result_data = {**_serialize_row(saved), "category_name": analysis.get("category", "")}
+                results.append(result_data)
+
+                yield _sse({"type": "completed", "file": file_name, "index": idx, "total": total,
+                            "result": result_data})
+
+            except Exception as e:
+                traceback.print_exc()
+                errors.append({"file": file_name, "error": str(e)})
+                yield _sse({"type": "error", "file": file_name, "index": idx, "total": total,
+                            "error": str(e)})
+
+        yield _sse({"type": "done", "processed": len(results), "errors": len(errors)})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ---- List Volume Files (for preview) ----
