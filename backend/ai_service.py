@@ -67,26 +67,60 @@ def _call_llm(prompt: str, max_tokens: int = 2048, temperature: float = 0.1) -> 
     return str(data)
 
 
+def convert_to_wav(audio_bytes: bytes, file_name: str) -> tuple[bytes, str]:
+    """Convert any audio format to 16kHz mono WAV using miniaudio (no ffmpeg needed).
+
+    Returns (wav_bytes, format_detected).
+    """
+    # Already WAV — return as-is
+    if audio_bytes[:4] == b'RIFF':
+        return audio_bytes, "wav"
+
+    import struct
+    import miniaudio
+
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "mp3"
+    format_map = {
+        "mp3": miniaudio.FileFormat.MP3,
+        "flac": miniaudio.FileFormat.FLAC,
+        "ogg": miniaudio.FileFormat.VORBIS,
+        "wav": miniaudio.FileFormat.WAV,
+    }
+    file_format = format_map.get(ext, miniaudio.FileFormat.MP3)
+
+    # Decode to raw PCM
+    decoded = miniaudio.decode(audio_bytes, output_format=miniaudio.SampleFormat.SIGNED16,
+                                nchannels=1, sample_rate=16000)
+    pcm_data = decoded.samples.tobytes()
+
+    # Build WAV header
+    sample_rate = 16000
+    channels = 1
+    sample_width = 2
+    data_size = len(pcm_data)
+    header = struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + data_size, b'WAVE',
+        b'fmt ', 16, 1, channels, sample_rate,
+        sample_rate * channels * sample_width, channels * sample_width, sample_width * 8,
+        b'data', data_size)
+
+    return header + pcm_data, ext
+
+
 def transcribe_audio(audio_bytes: bytes, file_name: str) -> dict:
     """Transcribe audio using Google Speech Recognition.
 
-    Accepts WAV files natively. For MP3/other formats, attempts pydub conversion
-    (requires ffmpeg) or returns error suggesting WAV format.
+    Automatically converts any format (MP3, OGG, FLAC, etc.) to WAV first.
     """
     recognizer = sr.Recognizer()
 
-    # If not WAV, try converting with pydub/ffmpeg
+    # Convert to WAV if needed
     if audio_bytes[:4] != b'RIFF':
         try:
-            from pydub import AudioSegment
-            ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "mp3"
-            audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
-            buf = io.BytesIO()
-            audio.export(buf, format="wav", parameters=["-ar", "16000", "-ac", "1"])
-            audio_bytes = buf.getvalue()
+            audio_bytes, fmt = convert_to_wav(audio_bytes, file_name)
         except Exception as e:
-            print(f"Cannot convert {file_name} to WAV: {e}")
-            return {"text": f"[Formato nao suportado: {file_name}. Use arquivos WAV.]"}
+            print(f"Cannot convert {file_name}: {e}")
+            return {"text": f"[Erro na conversao de {file_name}: {e}]"}
 
     # Read WAV with SpeechRecognition
     try:

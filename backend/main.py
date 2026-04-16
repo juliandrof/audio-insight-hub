@@ -262,7 +262,15 @@ async def process_batch_sse(req: BatchRequest):
                 resp = w.files.download(f.path)
                 audio_bytes = resp.contents.read()
 
-                # Stage 2: transcribing
+                # Stage 2: converting (if not WAV)
+                ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+                if ext != "wav" and audio_bytes[:4] != b'RIFF':
+                    yield _sse({"type": "status", "file": file_name, "index": idx, "total": total,
+                                "stage": "converting", "message": f"Convertendo {ext.upper()} para WAV..."})
+                    from .ai_service import convert_to_wav
+                    audio_bytes, _ = convert_to_wav(audio_bytes, file_name)
+
+                # Stage 3: transcribing
                 yield _sse({"type": "status", "file": file_name, "index": idx, "total": total,
                             "stage": "transcribing", "message": f"Transcrevendo {file_name}..."})
                 transcript_result = transcribe_audio(audio_bytes, file_name)

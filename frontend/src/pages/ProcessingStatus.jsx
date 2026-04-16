@@ -1,12 +1,13 @@
 import {
-  Loader2, CheckCircle2, AlertCircle, Clock, FolderOpen,
+  Loader2, CheckCircle2, AlertCircle, Clock, FolderOpen, RefreshCw,
   Headphones, Sparkles, Database, ChevronRight, Trash2, Activity
 } from 'lucide-react'
 import { useProcessing } from '../hooks/useProcessing'
 
 const STAGES = {
-  downloading:  { icon: FolderOpen,   color: 'text-blue-500',   bg: 'bg-blue-100 dark:bg-blue-500/20',   label: 'Baixando',       pct: 10 },
-  transcribing: { icon: Headphones,   color: 'text-purple-500', bg: 'bg-purple-100 dark:bg-purple-500/20', label: 'Transcrevendo',  pct: 40 },
+  downloading:  { icon: FolderOpen,   color: 'text-blue-500',   bg: 'bg-blue-100 dark:bg-blue-500/20',   label: 'Baixando',        pct: 8 },
+  converting:   { icon: RefreshCw,    color: 'text-indigo-500', bg: 'bg-indigo-100 dark:bg-indigo-500/20',label: 'Convertendo',     pct: 20 },
+  transcribing: { icon: Headphones,   color: 'text-purple-500', bg: 'bg-purple-100 dark:bg-purple-500/20', label: 'Transcrevendo',  pct: 45 },
   analyzing:    { icon: Sparkles,     color: 'text-amber-500',  bg: 'bg-amber-100 dark:bg-amber-500/20',  label: 'Analisando IA',  pct: 75 },
   saving:       { icon: Database,     color: 'text-cyan-500',   bg: 'bg-cyan-100 dark:bg-cyan-500/20',    label: 'Salvando',       pct: 90 },
   done:         { icon: CheckCircle2, color: 'text-green-500',  bg: 'bg-green-100 dark:bg-green-500/20',  label: 'Concluido',      pct: 100 },
